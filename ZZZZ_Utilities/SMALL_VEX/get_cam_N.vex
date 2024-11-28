@@ -1,0 +1,13 @@
+// execute in Details without any input
+
+string cam = chs("camera");
+vector p0 = fromNDC(cam,set(0.5,0.5,0));
+vector p1 = fromNDC(cam,set(0.5,0.5,-0.3));
+vector n = normalize(p1 - p0);
+
+addpoint(0,p0);
+// addpoint(0,p1);
+
+setpointattrib(0,"N",0,n,"set");
+
+// If you are planning to rename / change / move the camera or move this wrangle around it is advisable to change the string parameter into an operator path by clicking the gear icon on the parameters window and changing the type to "operator path"and operator filter to "object: camera only" so that the path does not break when moving and renaming the camera. 

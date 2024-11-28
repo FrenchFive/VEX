@@ -1,0 +1,7 @@
+vector nN = normalize(v@N);
+vector nup = normalize(v@up);
+
+vector4 p = quaternion(maketransform(nN*-1, nup));
+v@euler = degrees(quaterniontoeuler(p, 0));
+
+// point("/obj/my_point/OUT_euler",0,"euler",0) to read them

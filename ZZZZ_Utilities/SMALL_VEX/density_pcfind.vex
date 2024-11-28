@@ -1,0 +1,6 @@
+float radius = ch("radius");
+int maxpts = chi("maxpts");
+
+int pts [] = pcfind(0,'P',@P,radius,maxpts);
+
+@pc_density = len(pts) / float(maxpts);
