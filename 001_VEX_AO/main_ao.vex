@@ -1,0 +1,63 @@
+// Parameters
+int res_theta = chi("RESVert");        // Polar resolution (vertical slices)
+int res_phi = res_theta;               // Azimuthal resolution (horizontal slices per polar slice)
+float maxdist = 10.0;    
+float bias = 0.001;                    // Small offset to prevent self-intersection
+
+float occ = 0;                         // Initialize occlusion accumulator
+int total_samples = res_theta * res_phi; // Total number of samples
+
+vector N = normalize(@N);              // Normalize the normal vector
+
+for (int i = 0; i < res_theta; i++)
+{
+    // Sample cos(theta) uniformly from 1 to 0
+    float cos_theta = 1.0 - float(i) / (res_theta - 1);
+    float sin_theta = sqrt(1.0 - cos_theta * cos_theta);
+
+    for (int j = 0; j < res_phi; j++)
+    {
+        // Azimuthal angle (from 0 to 2π)
+        float phi = (float(j) / res_phi) * 2.0 * M_PI;
+
+        // Convert spherical coordinates to Cartesian coordinates (local space)
+        float x = sin_theta * cos(phi);
+        float y = sin_theta * sin(phi);
+        float z = cos_theta;
+
+        vector local_dir = set(x, y, z);
+
+        // Construct orthonormal basis
+        vector up = {0, 0, 1};
+        if (abs(dot(up, N)) > 0.999) 
+            up = {0, 1, 0};
+        vector tangent = normalize(cross(up, N));
+        vector bitangent = cross(N, tangent);
+
+        // Convert local direction to world space
+        vector world_dir = normalize(local_dir.x * tangent + local_dir.y * bitangent + local_dir.z * N);
+
+        vector pos = @P + world_dir * bias;
+
+        vector hitpos;
+        vector hituv;
+
+        // Perform ray intersection
+        int hit = intersect(0, pos, world_dir * maxdist, hitpos, hituv);
+
+        // If a valid hit occurs within maxdist, accumulate occlusion
+        if (hit >= 0)
+        {
+            float distance_hit = distance(pos, hitpos);
+            if (distance_hit < maxdist)
+            {
+                occ += 1.0;
+            }
+        }
+    }
+}
+
+occ = occ / total_samples;
+
+f@mask = occ;
+@Cd = occ;
