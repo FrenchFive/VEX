@@ -1,0 +1,17 @@
+float max_wet = @wet; // Start with the current point's wet value
+
+// Find neighbors within a specified radius
+int neighbors[] = nearpoints(0, @P, chf("radius"));
+
+foreach (int pt; neighbors) {
+    // Get the neighbor's wet value
+    float neighbor_wet = point(0, "wet", pt);
+    if (neighbor_wet > max_wet) {
+        max_wet = neighbor_wet; // Update to the highest wet value found
+    }
+}
+
+// Update the wet value with a spread factor (if desired)
+if (max_wet * chf("spread") > @wet){
+    @wet = max_wet * chf("spread");
+}
