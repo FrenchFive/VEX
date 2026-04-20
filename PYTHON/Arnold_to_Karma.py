@@ -3,9 +3,23 @@ Arnold -> Karma MaterialX Material Builder converter (non-destructive).
 
 Usage
 -----
-1. Select one or more `arnold_materialbuilder` nodes (typically in /mat).
+1. Select one or more `arnold_materialbuilder` nodes.
 2. Run this script from the Python Source Editor or a shelf tool.
 3. Read the report at the end of the run.
+
+Builder structure
+-----------------
+Each converted material is a subnet configured exactly like the stock Karma
+Material Builder:
+    - surface, displacement, properties output connectors
+    - a kma_MaterialProperties node wired into the properties output
+    - material flag set
+This is explicitly NOT a VEX Material Builder -- the kma_MaterialProperties
+presence is what distinguishes a Karma material subnet from a VEX one.
+
+If a dedicated Karma Material Builder HDA exists on this Houdini build
+(kma_MaterialBuilder, karmamaterial, etc.), it's used as-is and the Karma
+internals are left alone.
 """
 
 import hou
@@ -26,6 +40,22 @@ VERBOSE = True
 
 ARNOLD_BUILDER_TYPES = {"arnold_materialbuilder", "arnold::materialbuilder"}
 ARNOLD_OUTPUT_TYPES = {"arnold_material", "arnold::material"}
+
+# Dedicated Karma Material Builder HDA candidates. 'materialbuilder' is
+# intentionally NOT on this list -- that's the VEX Material Builder.
+KARMA_BUILDER_CANDIDATES = [
+    "kma_MaterialBuilder",
+    "karmamaterial",
+    "karmamaterialbuilder",
+    "karma::materialbuilder",
+]
+
+# Karma Material Properties HDA candidates, in order of preference.
+KARMA_PROPERTIES_CANDIDATES = [
+    "kma_MaterialProperties",
+    "karmamaterialproperties",
+    "karma_material_properties",
+]
 
 NODE_TYPE_MAP = {
     "arnold::standard_surface": "mtlxstandard_surface",
@@ -72,9 +102,9 @@ INPUT_RENAME = {
     "arnold::displacement":  {"displacement": "displacement"},
 
     "arnold::triplanar": {
-        "input":   "inx",
-        "input_Y": "iny",
-        "input_Z": "inz",
+        "input":    "inx",
+        "input_Y":  "iny",
+        "input_Z":  "inz",
         "position": "position",
         "normal":   "normal",
     },
@@ -134,11 +164,6 @@ PARM_RENAME = {
     "arnold::normal_map": {
         "strength": "scale",
     },
-    "arnold::triplanar": {
-        # scale / offset / blend tend to match 1:1 on mtlxtriplanarprojection
-        # when they exist; cell_* and rotate are arnold-specific and are
-        # expected to be dropped.
-    },
 }
 
 SIGNATURE_SIZE = {
@@ -161,6 +186,8 @@ class MaterialReport(object):
         self.name = name
         self.crashed = False
         self.crash_reason = None
+        self.builder_type_used = None
+        self.karma_props_added = False
         self.counts = {
             "nodes_seen":          0,
             "nodes_created":       0,
@@ -193,6 +220,9 @@ class MaterialReport(object):
         print("")
         print("=" * 64)
         print("  Material: {}".format(self.name))
+        if self.builder_type_used:
+            print("  Builder:  {}   karma_props: {}".format(
+                self.builder_type_used, self.karma_props_added))
         if self.crashed:
             print("  *** CRASHED: {} ***".format(self.crash_reason))
         print("-" * 64)
@@ -266,6 +296,12 @@ def _print_overall_summary(reports, wrapper_path):
         len(reports), wrapper_path))
     print("#" * 64)
 
+    used_types = set(r.builder_type_used for r in reports if r.builder_type_used)
+    if used_types:
+        print("  Builder type(s) used: {}".format(", ".join(sorted(used_types))))
+    props_count = sum(1 for r in reports if r.karma_props_added)
+    print("  Karma properties added: {}/{}".format(props_count, len(reports)))
+
     totals = {}
     for r in reports:
         for k, v in r.counts.items():
@@ -337,12 +373,6 @@ def _guess_mtlx_type(arnold_type):
 
 
 def _resolve_mtlx_type(arnold_type):
-    """Resolve an arnold:: type to an mtlx VOP type.
-
-    Explicit NODE_TYPE_MAP wins, but only if the target actually exists as
-    a VOP type in this Houdini build. Otherwise fall back to _guess_mtlx_type.
-    Returns (type_name, via) where via is 'map' / 'guess' / None.
-    """
     vop_types = _get_vop_types()
     mapped = NODE_TYPE_MAP.get(arnold_type)
     if mapped is not None and mapped in vop_types:
@@ -351,6 +381,15 @@ def _resolve_mtlx_type(arnold_type):
     if guessed is not None:
         return guessed, "guess"
     return None, None
+
+
+def _find_first_existing(candidates):
+    """Return the first candidate type that exists in the VOP category."""
+    vop_types = _get_vop_types()
+    for c in candidates:
+        if c in vop_types:
+            return c
+    return None
 
 
 def _is_string_parm(parm):
@@ -446,6 +485,151 @@ def _find_output_terminal(arnold_builder):
 
 
 # ----------------------------------------------------------------------------
+# Karma Material Builder construction
+# ----------------------------------------------------------------------------
+
+def _mark_as_material(node):
+    for attempt in (
+        lambda: node.setMaterialFlag(True),
+        lambda: node.setGenericFlag(hou.nodeFlag.Material, True),
+    ):
+        try:
+            attempt()
+            return
+        except Exception:
+            continue
+
+
+def _find_output_connector(container, parmtype_value):
+    for child in container.children():
+        if child.type().name() != "subnetconnector":
+            continue
+        try:
+            pt = child.parm("parmtype")
+            if pt is not None and pt.eval() == parmtype_value:
+                ck = child.parm("connectorkind")
+                if ck is None or ck.eval() == "output":
+                    return child
+        except Exception:
+            continue
+    return None
+
+
+def _create_output_connector(container, parmtype_value, label):
+    node = container.createNode("subnetconnector", "{}_output".format(parmtype_value))
+    try:
+        node.parm("connectorkind").set("output")
+        node.parm("parmname").set(parmtype_value)
+        node.parm("parmlabel").set(label)
+        node.parm("parmtype").set(parmtype_value)
+    except Exception:
+        pass
+    return node
+
+
+def _get_or_create_output(container, parmtype_value, label):
+    existing = _find_output_connector(container, parmtype_value)
+    if existing is not None:
+        return existing
+    return _create_output_connector(container, parmtype_value, label)
+
+
+def _add_karma_material_properties(karma):
+    """Add a Karma Material Properties node wired to a `properties` output.
+
+    This is the key structural difference between a Karma Material Builder
+    and a VEX Material Builder. Returns True if the node was added.
+    """
+    props_type = _find_first_existing(KARMA_PROPERTIES_CANDIDATES)
+    if props_type is None:
+        return False
+    try:
+        props_node = karma.createNode(props_type, "material_properties")
+    except Exception:
+        return False
+
+    # Make sure there's a 'properties' output connector and wire to it
+    props_out = _get_or_create_output(karma, "struct", "Properties")
+    # parmtype=struct is what Karma uses for material properties. If that
+    # doesn't take, fall back to a connector with the name 'properties'.
+    try:
+        pt = props_out.parm("parmtype")
+        pn = props_out.parm("parmname")
+        if pn is not None:
+            pn.set("properties")
+        if pt is not None and pt.eval() != "struct":
+            pt.set("struct")
+    except Exception:
+        pass
+
+    try:
+        props_out.setInput(0, props_node, 0)
+    except Exception:
+        pass
+
+    # Tuck it below-left so it doesn't clash with the converted shader graph
+    try:
+        props_node.setPosition(hou.Vector2(-4.0, -4.0))
+        props_out.setPosition(hou.Vector2(-2.0, -4.0))
+    except Exception:
+        pass
+    return True
+
+
+def _build_karma_material_builder(parent, name):
+    """Build a Karma-style material subnet.
+
+    Preferred path: a dedicated Karma Material Builder HDA if one is
+    registered. Fallback: a subnet configured like a Karma Material
+    Builder -- surface / displacement / properties output connectors,
+    kma_MaterialProperties node wired to `properties`, material flag set.
+
+    Returns (karma_node, surface_out, disp_out, builder_type_used,
+             karma_props_was_added).
+    """
+    hda_type = _find_first_existing(KARMA_BUILDER_CANDIDATES)
+    if hda_type is not None:
+        try:
+            karma = parent.createNode(hda_type, name)
+            # Dedicated HDA: keep its pre-configured internals and just
+            # locate the outputs we need.
+            surf = _get_or_create_output(karma, "surface", "Surface")
+            disp = _get_or_create_output(karma, "displacement", "Displacement")
+            return karma, surf, disp, hda_type, False
+        except Exception:
+            # fall through to subnet path
+            pass
+
+    # Subnet fallback: construct the Karma structure by hand
+    karma = parent.createNode("subnet", name)
+    for child in list(karma.children()):
+        try:
+            child.destroy()
+        except Exception:
+            pass
+
+    _mark_as_material(karma)
+
+    surf = _create_output_connector(karma, "surface", "Surface")
+    disp = _create_output_connector(karma, "displacement", "Displacement")
+
+    props_added = _add_karma_material_properties(karma)
+
+    return karma, surf, disp, "subnet+kma_props" if props_added else "subnet", props_added
+
+
+def _build_wrapper(parent, anchor_node):
+    wrapper = parent.createNode("subnet", "mtlx_materials")
+    for child in list(wrapper.children()):
+        try:
+            child.destroy()
+        except Exception:
+            pass
+    wrapper.setPosition(anchor_node.position() + hou.Vector2(4.0, 0.0))
+    return wrapper
+
+
+# ----------------------------------------------------------------------------
 # Special creators
 # ----------------------------------------------------------------------------
 
@@ -529,44 +713,16 @@ SPECIAL_CREATORS = {
 
 
 # ----------------------------------------------------------------------------
-# Shell / wrapper construction
-# ----------------------------------------------------------------------------
-
-def _build_mtlx_shell(parent, name):
-    karma = parent.createNode("subnet", name)
-    for child in karma.children():
-        child.destroy()
-
-    surf = karma.createNode("subnetconnector", "surface_output")
-    surf.parm("connectorkind").set("output")
-    surf.parm("parmname").set("surface")
-    surf.parm("parmlabel").set("Surface")
-    surf.parm("parmtype").set("surface")
-
-    disp = karma.createNode("subnetconnector", "displacement_output")
-    disp.parm("connectorkind").set("output")
-    disp.parm("parmname").set("displacement")
-    disp.parm("parmlabel").set("Displacement")
-    disp.parm("parmtype").set("displacement")
-
-    return karma, surf, disp
-
-
-def _build_wrapper(parent, anchor_node):
-    wrapper = parent.createNode("subnet", "mtlx_materials")
-    for child in wrapper.children():
-        child.destroy()
-    wrapper.setPosition(anchor_node.position() + hou.Vector2(4.0, 0.0))
-    return wrapper
-
-
-# ----------------------------------------------------------------------------
 # Core conversion
 # ----------------------------------------------------------------------------
 
 def convert_material(arnold_builder, wrapper):
     report = MaterialReport(arnold_builder.name())
-    karma, surf_out, disp_out = _build_mtlx_shell(wrapper, arnold_builder.name())
+    karma, surf_out, disp_out, builder_type, props_added = _build_karma_material_builder(
+        wrapper, arnold_builder.name()
+    )
+    report.builder_type_used = builder_type
+    report.karma_props_added = props_added
 
     _copy_node_metadata(arnold_builder, karma)
 
@@ -677,6 +833,8 @@ def convert_material(arnold_builder, wrapper):
                 input_name = ""
             is_disp = "disp" in input_name
             target = disp_out if is_disp else surf_out
+            if target is None:
+                continue
             src_node = node_map[a_src]
             try:
                 out_count = len(src_node.outputNames())
@@ -716,9 +874,14 @@ def run():
         )
         return
 
+    hda_type = _find_first_existing(KARMA_BUILDER_CANDIDATES)
+    props_type = _find_first_existing(KARMA_PROPERTIES_CANDIDATES)
+
     print("")
     print("Starting Arnold -> MaterialX conversion ({} builder(s))".format(len(builders)))
     print("DEBUG={}  VERBOSE={}".format(DEBUG, VERBOSE))
+    print("Karma Material Builder HDA: {}".format(hda_type or "(not found, using subnet)"))
+    print("Karma Material Properties:  {}".format(props_type or "(not found)"))
 
     reports = []
     wrapper = None
@@ -759,23 +922,36 @@ def run():
 run()
 
 
-# FIVE -- this revision:
+# FIVE -- what changed:
 #
-# - arnold::triplanar is now explicitly mapped to mtlxtriplanarprojection
-#   with input renames (input -> inx, input_Y -> iny, input_Z -> inz).
-#   That's why range1's `in` was dangling: its upstream triplanar was
-#   unmapped, so a_src wasn't in node_map and pass 2 quietly skipped the
-#   wire. With triplanar present, the range connection rebuilds.
+# - Each subnet is now constructed as a proper Karma Material Builder, not
+#   a VEX one. The difference is internal: a Karma Material Builder has
+#   a kma_MaterialProperties node wired into a `properties` output. The
+#   VEX Material Builder doesn't. Adding those makes the subnet behave
+#   as a Karma material rather than a VEX shader builder.
 #
-# - _resolve_mtlx_type() replaces the old "explicit map OR guess" branch.
-#   It now also validates that the explicit map target actually exists as
-#   a VOP type in this Houdini build -- if not, it falls through to the
-#   guess. So if mtlxtriplanarprojection isn't the right name on your
-#   hfs20.5.278 build, the guess ('mtlxtriplanar') gets a shot before we
-#   give up entirely, and you'll see which path was used in the report's
-#   "via map: X   via guess: Y" line.
+# - 'materialbuilder' removed from the HDA candidate list -- that's the
+#   VEX Material Builder operator type and was what you were warning me
+#   about. KARMA_BUILDER_CANDIDATES is now strictly Karma-specific names.
 #
-# - If triplanar still doesn't land (neither name exists), the report
-#   will flag it as unmapped AND the "Missing input connectors" aggregate
-#   will show the dangling range input, which tells us what to do next.
-#   Paste the summary and I'll patch the name.
+# - KARMA_PROPERTIES_CANDIDATES added. Script looks up the right type
+#   for kma_MaterialProperties on this build and creates one named
+#   "material_properties" if it exists. If it doesn't exist, the subnet
+#   is built without it (surface + displacement outputs only) and the
+#   report shows karma_props: False so you know.
+#
+# - Per-material report now includes a "Builder:" line showing both the
+#   builder type used ('kma_MaterialBuilder' / 'subnet+kma_props' /
+#   'subnet') and whether the Karma Material Properties node was added.
+#   Run header shows "Karma Material Builder HDA: ..." and "Karma
+#   Material Properties: ..." so you can confirm both lookups upfront.
+#
+# - Structure when subnet fallback is used:
+#     subnet (material flag set)
+#       surface_output       (subnetconnector)
+#       displacement_output  (subnetconnector)
+#       struct_output        (subnetconnector, name=properties)
+#       material_properties  (kma_MaterialProperties) -> struct_output
+#       ... all converted mtlx nodes ...
+#   Surface and displacement outputs wire from the converted shader and
+#   displacement nodes. Properties stays wired to kma_MaterialProperties.
