@@ -36,6 +36,7 @@ NODE_TYPE_MAP = {
     "arnold::checkerboard":     "mtlxchecker",
     "arnold::noise":            "mtlxfractal3d",
     "arnold::cell_noise":       "mtlxcellnoise3d",
+    "arnold::triplanar":        "mtlxtriplanarprojection",
 
     "arnold::user_data_float":  "mtlxconstant",
     "arnold::user_data_int":    "mtlxconstant",
@@ -62,10 +63,6 @@ NODE_TYPE_MAP = {
     "arnold::ramp_float":       "mtlxramplr",
 }
 
-# Input connector renames: Arnold input name -> MaterialX input name.
-# These ALSO apply to parm names during parm copy (input1 is a parm until
-# it gets connected), so mapping it here is enough -- no need to duplicate
-# into PARM_RENAME.
 INPUT_RENAME = {
     "arnold::image":         {"uvcoords": "texcoord"},
     "arnold::bump2d":        {"bump_map": "height", "normal": "normal"},
@@ -73,6 +70,14 @@ INPUT_RENAME = {
     "arnold::normal_map":    {"input": "in"},
     "arnold::color_correct": {"input": "in"},
     "arnold::displacement":  {"displacement": "displacement"},
+
+    "arnold::triplanar": {
+        "input":   "inx",
+        "input_Y": "iny",
+        "input_Z": "inz",
+        "position": "position",
+        "normal":   "normal",
+    },
 
     "arnold::range": {
         "input":      "in",
@@ -82,14 +87,12 @@ INPUT_RENAME = {
         "output_max": "outhigh",
     },
 
-    # Two-input blenders: arnold input1/input2 -> mtlx bg/fg
     "arnold::mix_rgba":    {"input1": "bg", "input2": "fg", "mix": "mix"},
     "arnold::mix_shader":  {"input1": "bg", "input2": "fg", "mix": "mix"},
     "arnold::mix_float":   {"input1": "bg", "input2": "fg", "mix": "mix"},
     "arnold::layer_rgba":  {"input1": "bg", "input2": "fg"},
     "arnold::layer_float": {"input1": "bg", "input2": "fg"},
 
-    # Two-input math: arnold input1/input2 -> mtlx in1/in2
     "arnold::multiply": {"input1": "in1", "input2": "in2"},
     "arnold::add":      {"input1": "in1", "input2": "in2"},
     "arnold::subtract": {"input1": "in1", "input2": "in2"},
@@ -100,7 +103,6 @@ INPUT_RENAME = {
     "arnold::dot":      {"input1": "in1", "input2": "in2"},
     "arnold::power":    {"base": "in1", "exponent": "in2"},
 
-    # Single-input math
     "arnold::abs":       {"input": "in"},
     "arnold::sign":      {"input": "in"},
     "arnold::sqrt":      {"input": "in"},
@@ -113,9 +115,6 @@ INPUT_RENAME = {
     "arnold::clamp": {"input": "in", "min": "low", "max": "high"},
 }
 
-# Parm renames that aren't also input renames (pure parm-only translations).
-# The copy function falls back to INPUT_RENAME if a name isn't here, so
-# anything above doesn't need to be duplicated.
 PARM_RENAME = {
     "arnold::image": {
         "filename":               "file",
@@ -134,6 +133,11 @@ PARM_RENAME = {
     },
     "arnold::normal_map": {
         "strength": "scale",
+    },
+    "arnold::triplanar": {
+        # scale / offset / blend tend to match 1:1 on mtlxtriplanarprojection
+        # when they exist; cell_* and rotate are arnold-specific and are
+        # expected to be dropped.
     },
 }
 
@@ -282,7 +286,6 @@ def _print_overall_summary(reports, wrapper_path):
         for t, count in sorted(unmapped_types.items(), key=lambda x: -x[1]):
             print("    {:<40} x {}".format(t, count))
 
-    # Aggregate input_missing across materials to flag missing INPUT_RENAME entries
     missing_inputs = {}
     for r in reports:
         for m_type, name, _ in r.input_missing:
@@ -333,6 +336,23 @@ def _guess_mtlx_type(arnold_type):
     return candidate if candidate in _get_vop_types() else None
 
 
+def _resolve_mtlx_type(arnold_type):
+    """Resolve an arnold:: type to an mtlx VOP type.
+
+    Explicit NODE_TYPE_MAP wins, but only if the target actually exists as
+    a VOP type in this Houdini build. Otherwise fall back to _guess_mtlx_type.
+    Returns (type_name, via) where via is 'map' / 'guess' / None.
+    """
+    vop_types = _get_vop_types()
+    mapped = NODE_TYPE_MAP.get(arnold_type)
+    if mapped is not None and mapped in vop_types:
+        return mapped, "map"
+    guessed = _guess_mtlx_type(arnold_type)
+    if guessed is not None:
+        return guessed, "guess"
+    return None, None
+
+
 def _is_string_parm(parm):
     try:
         return parm.parmTemplate().type() == hou.parmTemplateType.String
@@ -341,12 +361,6 @@ def _is_string_parm(parm):
 
 
 def _translate_name(arnold_type, name, prefer_parm=False):
-    """Resolve an Arnold parm/input name to its MTLX equivalent.
-
-    For parms: checks PARM_RENAME first, then falls back to INPUT_RENAME
-    (since input-connector names also act as parms when disconnected).
-    For inputs: the reverse order.
-    """
     if prefer_parm:
         primary   = PARM_RENAME.get(arnold_type, {})
         secondary = INPUT_RENAME.get(arnold_type, {})
@@ -388,7 +402,6 @@ def _copy_parms(src, dst, report):
 
 
 def _copy_node_metadata(src, dst):
-    """Preserve position, color, comment, and bypass flag from the Arnold node."""
     try:
         dst.setPosition(src.position())
     except Exception:
@@ -555,7 +568,6 @@ def convert_material(arnold_builder, wrapper):
     report = MaterialReport(arnold_builder.name())
     karma, surf_out, disp_out = _build_mtlx_shell(wrapper, arnold_builder.name())
 
-    # Copy the builder's own metadata onto the new subnet
     _copy_node_metadata(arnold_builder, karma)
 
     node_map = {}
@@ -579,11 +591,7 @@ def convert_material(arnold_builder, wrapper):
                 report.create_failed.append((a_node.name(), a_type, str(err)))
                 continue
         else:
-            mtlx_type = NODE_TYPE_MAP.get(a_type)
-            via = "map"
-            if mtlx_type is None:
-                mtlx_type = _guess_mtlx_type(a_type)
-                via = "guess"
+            mtlx_type, via = _resolve_mtlx_type(a_type)
             if mtlx_type is None:
                 if a_type.startswith("arnold"):
                     report.unmapped.append((a_node.name(), a_type))
@@ -636,9 +644,6 @@ def convert_material(arnold_builder, wrapper):
                 )
                 continue
 
-            # Clamp output index -- mtlx nodes often have fewer outputs than
-            # their arnold counterparts (e.g. arnold::image exposes rgba/r/g/b/a,
-            # mtlximage exposes just 'out').
             src_node = node_map[a_src]
             try:
                 out_count = len(src_node.outputNames())
@@ -692,10 +697,6 @@ def convert_material(arnold_builder, wrapper):
                      "OUTPUT({})".format("disp" if is_disp else "surf"),
                      str(err))
                 )
-
-    # NOTE: intentionally NOT calling karma.layoutChildren() -- it overrides
-    # the positions we just copied from the Arnold side. The goal is to
-    # preserve the user's original layout.
 
     return karma, report
 
@@ -758,42 +759,23 @@ def run():
 run()
 
 
-# FIVE -- this revision fixes the orphan-node issue from the screenshot:
+# FIVE -- this revision:
 #
-# - INPUT_RENAME expanded massively. The reason your mix_rgba3, mix_rgba2,
-#   multiply1, layer nodes etc. were floating disconnected: Arnold uses
-#   `input1`/`input2` on every two-input math/blend node, MaterialX uses
-#   `bg`/`fg` (for mix) or `in1`/`in2` (for math). Without the translation,
-#   pass 2 was hitting "input not found" and bailing out silently. Full
-#   coverage now for mix/layer/multiply/add/subtract/divide/min/max/power/
-#   cross/dot, plus single-input ones like abs/sqrt/exp/log/normalize/
-#   luminance/clamp. The range node also covers input_min/max/output_min/max
-#   in case anyone connects to those ports instead of setting them as parms.
+# - arnold::triplanar is now explicitly mapped to mtlxtriplanarprojection
+#   with input renames (input -> inx, input_Y -> iny, input_Z -> inz).
+#   That's why range1's `in` was dangling: its upstream triplanar was
+#   unmapped, so a_src wasn't in node_map and pass 2 quietly skipped the
+#   wire. With triplanar present, the range connection rebuilds.
 #
-# - Node color / comment / bypass flag are now preserved via
-#   _copy_node_metadata(). Also applied to the builder itself, so the
-#   overall material subnet inherits the Arnold builder's color.
+# - _resolve_mtlx_type() replaces the old "explicit map OR guess" branch.
+#   It now also validates that the explicit map target actually exists as
+#   a VOP type in this Houdini build -- if not, it falls through to the
+#   guess. So if mtlxtriplanarprojection isn't the right name on your
+#   hfs20.5.278 build, the guess ('mtlxtriplanar') gets a shot before we
+#   give up entirely, and you'll see which path was used in the report's
+#   "via map: X   via guess: Y" line.
 #
-# - Dropped the inner karma.layoutChildren() call. It was silently
-#   overriding the Arnold positions I'd just copied -- that's why your
-#   result looked auto-flowed top-to-bottom instead of matching the
-#   Arnold layout. Positions are now pulled straight from the source
-#   nodes. The wrapper still calls layoutChildren on ITS children (the
-#   material subnets themselves), which is what you want for organizing
-#   multiple converted materials.
-#
-# - Output index clamping added. arnold::image exposes rgba/r/g/b/a as
-#   separate outputs; mtlximage exposes one 'out'. If the Arnold graph
-#   was wired from e.g. the 'r' output (index 1), we used to pass that
-#   index through to setInput and fail. Now if the mtlx side has fewer
-#   outputs than the arnold index requests, we clamp to 0.
-#
-# - Overall summary now aggregates missing input connectors across all
-#   materials too -- the "Missing input connectors" section tells you
-#   exactly which (mtlx_type, input_name) pairs need adding to
-#   INPUT_RENAME, sorted by count.
-#
-# - _translate_name() unifies parm and input rename lookups: parm copy
-#   prefers PARM_RENAME then falls back to INPUT_RENAME, and input
-#   rebuild prefers INPUT_RENAME then falls back to PARM_RENAME. So
-#   input1/input2 style renames only need to live in one table.
+# - If triplanar still doesn't land (neither name exists), the report
+#   will flag it as unmapped AND the "Missing input connectors" aggregate
+#   will show the dangling range input, which tells us what to do next.
+#   Paste the summary and I'll patch the name.
