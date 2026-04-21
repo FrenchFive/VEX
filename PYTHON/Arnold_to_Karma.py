@@ -4,34 +4,35 @@ Arnold -> Karma MaterialX Material Builder converter (non-destructive).
 Usage
 -----
 1. Select one or more `arnold_materialbuilder` nodes.
-2. Run this script from the Python Source Editor or a shelf tool.
+2. Run this script from the Python Source Editor.
 3. Read the report at the end of the run.
 
-Builder structure
------------------
-Each converted material is a subnet configured exactly like the stock Karma
-Material Builder:
-    - surface, displacement, properties output connectors
-    - a kma_MaterialProperties node wired into the properties output
-    - material flag set
-This is explicitly NOT a VEX Material Builder -- the kma_MaterialProperties
-presence is what distinguishes a Karma material subnet from a VEX one.
-
-If a dedicated Karma Material Builder HDA exists on this Houdini build
-(kma_MaterialBuilder, karmamaterial, etc.), it's used as-is and the Karma
-internals are left alone.
+Workflow
+--------
+For each material:
+  1. Create the Karma builder (via voptoolutils or template clone)
+  2. Find/create the three terminal nodes: standard_surface, displacement, properties
+  3. Wire them into the suboutput IN THIS ORDER: surface, displacement, properties
+  4. Rename slot 2's parmname to 'displacement' and label to 'Displacement'
+  5. Build the Arnold graph inside, replacing the placeholder surface with
+     the converted Arnold standard_surface chain
 """
 
 import hou
+import inspect
 import traceback
 
+try:
+    import voptoolutils
+except ImportError:
+    voptoolutils = None
 
-# ----------------------------------------------------------------------------
-# Debug toggles
-# ----------------------------------------------------------------------------
 
 DEBUG   = True
 VERBOSE = True
+
+TEMPLATE_KARMA_PATH = None
+TEMPLATE_NAME_HINTS = ("karma_template", "karmamaterial_template", "mtlx_template")
 
 
 # ----------------------------------------------------------------------------
@@ -40,22 +41,6 @@ VERBOSE = True
 
 ARNOLD_BUILDER_TYPES = {"arnold_materialbuilder", "arnold::materialbuilder"}
 ARNOLD_OUTPUT_TYPES = {"arnold_material", "arnold::material"}
-
-# Dedicated Karma Material Builder HDA candidates. 'materialbuilder' is
-# intentionally NOT on this list -- that's the VEX Material Builder.
-KARMA_BUILDER_CANDIDATES = [
-    "kma_MaterialBuilder",
-    "karmamaterial",
-    "karmamaterialbuilder",
-    "karma::materialbuilder",
-]
-
-# Karma Material Properties HDA candidates, in order of preference.
-KARMA_PROPERTIES_CANDIDATES = [
-    "kma_MaterialProperties",
-    "karmamaterialproperties",
-    "karma_material_properties",
-]
 
 NODE_TYPE_MAP = {
     "arnold::standard_surface": "mtlxstandard_surface",
@@ -142,7 +127,8 @@ INPUT_RENAME = {
     "arnold::length":    {"input": "in"},
     "arnold::luminance": {"input": "in"},
 
-    "arnold::clamp": {"input": "in", "min": "low", "max": "high"},
+    "arnold::clamp": {"input": "in", "low": "low", "high": "high",
+                      "min": "low", "max": "high"},
 }
 
 PARM_RENAME = {
@@ -176,6 +162,9 @@ SIGNATURE_SIZE = {
     "color4":  4, "vector4": 4,
 }
 
+SURFACE_NAME_MARKERS      = ("surface", "shader", "surf")
+DISPLACEMENT_NAME_MARKERS = ("displacement", "displace", "disp")
+
 
 # ----------------------------------------------------------------------------
 # Report
@@ -186,8 +175,9 @@ class MaterialReport(object):
         self.name = name
         self.crashed = False
         self.crash_reason = None
-        self.builder_type_used = None
-        self.karma_props_added = False
+        self.builder_method = None
+        self.terminal_info = None
+        self.properties_connected = False
         self.counts = {
             "nodes_seen":          0,
             "nodes_created":       0,
@@ -220,9 +210,10 @@ class MaterialReport(object):
         print("")
         print("=" * 64)
         print("  Material: {}".format(self.name))
-        if self.builder_type_used:
-            print("  Builder:  {}   karma_props: {}".format(
-                self.builder_type_used, self.karma_props_added))
+        if self.builder_method:
+            print("  Builder:  {}".format(self.builder_method))
+        if self.terminal_info:
+            print("  Terminal: {}".format(self.terminal_info))
         if self.crashed:
             print("  *** CRASHED: {} ***".format(self.crash_reason))
         print("-" * 64)
@@ -243,8 +234,9 @@ class MaterialReport(object):
             self._pct(c["conns_made"], c["conns_attempted"])))
         print("               input-missing: {}   wire-failed: {}".format(
             c["conns_input_missing"], c["conns_wire_failed"]))
-        print("  Outputs:     surface={}   displacement={}".format(
-            self.surface_connected, self.displacement_connected))
+        print("  Outputs:     surface={}   displacement={}   properties={}".format(
+            self.surface_connected, self.displacement_connected,
+            self.properties_connected))
 
         if self.unmapped:
             print("")
@@ -296,11 +288,9 @@ def _print_overall_summary(reports, wrapper_path):
         len(reports), wrapper_path))
     print("#" * 64)
 
-    used_types = set(r.builder_type_used for r in reports if r.builder_type_used)
-    if used_types:
-        print("  Builder type(s) used: {}".format(", ".join(sorted(used_types))))
-    props_count = sum(1 for r in reports if r.karma_props_added)
-    print("  Karma properties added: {}/{}".format(props_count, len(reports)))
+    methods = set(r.builder_method for r in reports if r.builder_method)
+    if methods:
+        print("  Builder method(s): {}".format(", ".join(sorted(methods))))
 
     totals = {}
     for r in reports:
@@ -340,12 +330,28 @@ def _print_overall_summary(reports, wrapper_path):
         for name in crashed:
             print("    - {}".format(name))
 
-    broken = [r.name for r in reports
-              if not r.crashed and not r.surface_connected]
-    if broken:
+    broken_surf = [r.name for r in reports
+                   if not r.crashed and not r.surface_connected]
+    if broken_surf:
         print("")
         print("  Materials with NO surface output connected:")
-        for name in broken:
+        for name in broken_surf:
+            print("    - {}".format(name))
+
+    not_disp = [r.name for r in reports
+                if not r.crashed and not r.displacement_connected]
+    if not_disp:
+        print("")
+        print("  Materials with NO displacement output connected:")
+        for name in not_disp:
+            print("    - {}".format(name))
+
+    no_props = [r.name for r in reports
+                if not r.crashed and not r.properties_connected]
+    if no_props:
+        print("")
+        print("  Materials with NO properties output connected:")
+        for name in no_props:
             print("    - {}".format(name))
 
     print("#" * 64)
@@ -381,15 +387,6 @@ def _resolve_mtlx_type(arnold_type):
     if guessed is not None:
         return guessed, "guess"
     return None, None
-
-
-def _find_first_existing(candidates):
-    """Return the first candidate type that exists in the VOP category."""
-    vop_types = _get_vop_types()
-    for c in candidates:
-        if c in vop_types:
-            return c
-    return None
 
 
 def _is_string_parm(parm):
@@ -484,138 +481,233 @@ def _find_output_terminal(arnold_builder):
     return None
 
 
-# ----------------------------------------------------------------------------
-# Karma Material Builder construction
-# ----------------------------------------------------------------------------
-
-def _mark_as_material(node):
-    for attempt in (
-        lambda: node.setMaterialFlag(True),
-        lambda: node.setGenericFlag(hou.nodeFlag.Material, True),
-    ):
-        try:
-            attempt()
-            return
-        except Exception:
-            continue
-
-
-def _find_output_connector(container, parmtype_value):
-    for child in container.children():
-        if child.type().name() != "subnetconnector":
-            continue
-        try:
-            pt = child.parm("parmtype")
-            if pt is not None and pt.eval() == parmtype_value:
-                ck = child.parm("connectorkind")
-                if ck is None or ck.eval() == "output":
-                    return child
-        except Exception:
-            continue
+def _classify_terminal_input(input_name):
+    nl = input_name.lower()
+    if any(m in nl for m in DISPLACEMENT_NAME_MARKERS):
+        return "displacement"
+    if any(m in nl for m in SURFACE_NAME_MARKERS):
+        return "surface"
     return None
 
 
-def _create_output_connector(container, parmtype_value, label):
-    node = container.createNode("subnetconnector", "{}_output".format(parmtype_value))
+# ----------------------------------------------------------------------------
+# Karma Material Builder creation
+# ----------------------------------------------------------------------------
+
+def _find_template_node(wrapper_parent):
+    if TEMPLATE_KARMA_PATH:
+        node = hou.node(TEMPLATE_KARMA_PATH)
+        if node is not None:
+            return node
+
+    search = wrapper_parent
+    while search is not None:
+        for child in search.children():
+            if child.name() in TEMPLATE_NAME_HINTS:
+                return child
+            for hint in TEMPLATE_NAME_HINTS:
+                if hint in child.name():
+                    return child
+        search = search.parent()
+    return None
+
+
+def _copy_template(template, destination, name):
+    copied = hou.copyNodesTo([template], destination)
+    if not copied:
+        raise RuntimeError("hou.copyNodesTo returned nothing")
+    clone = copied[0]
     try:
-        node.parm("connectorkind").set("output")
-        node.parm("parmname").set(parmtype_value)
-        node.parm("parmlabel").set(label)
-        node.parm("parmtype").set(parmtype_value)
+        clone.setName(name, unique_name=True)
     except Exception:
         pass
-    return node
+    return clone
 
 
-def _get_or_create_output(container, parmtype_value, label):
-    existing = _find_output_connector(container, parmtype_value)
-    if existing is not None:
-        return existing
-    return _create_output_connector(container, parmtype_value, label)
+def _build_karma_material_builder_from_template(wrapper, template, name):
+    clone = _copy_template(template, wrapper, name)
+    return clone, "template_clone({})".format(template.path())
 
 
-def _add_karma_material_properties(karma):
-    """Add a Karma Material Properties node wired to a `properties` output.
-
-    This is the key structural difference between a Karma Material Builder
-    and a VEX Material Builder. Returns True if the node was added.
-    """
-    props_type = _find_first_existing(KARMA_PROPERTIES_CANDIDATES)
-    if props_type is None:
-        return False
+def _inspect_voptoolutils_signature():
+    if voptoolutils is None or not hasattr(voptoolutils, "_setupMtlXBuilderSubnet"):
+        return None
     try:
-        props_node = karma.createNode(props_type, "material_properties")
-    except Exception:
-        return False
-
-    # Make sure there's a 'properties' output connector and wire to it
-    props_out = _get_or_create_output(karma, "struct", "Properties")
-    # parmtype=struct is what Karma uses for material properties. If that
-    # doesn't take, fall back to a connector with the name 'properties'.
-    try:
-        pt = props_out.parm("parmtype")
-        pn = props_out.parm("parmname")
-        if pn is not None:
-            pn.set("properties")
-        if pt is not None and pt.eval() != "struct":
-            pt.set("struct")
-    except Exception:
-        pass
-
-    try:
-        props_out.setInput(0, props_node, 0)
-    except Exception:
-        pass
-
-    # Tuck it below-left so it doesn't clash with the converted shader graph
-    try:
-        props_node.setPosition(hou.Vector2(-4.0, -4.0))
-        props_out.setPosition(hou.Vector2(-2.0, -4.0))
-    except Exception:
-        pass
-    return True
+        sig = inspect.signature(voptoolutils._setupMtlXBuilderSubnet)
+        params = list(sig.parameters.keys())
+        print("voptoolutils._setupMtlXBuilderSubnet signature: ({})".format(
+            ", ".join(params)))
+        return params
+    except Exception as err:
+        print("[WARN] could not inspect voptoolutils signature: {}".format(err))
+        return None
 
 
-def _build_karma_material_builder(parent, name):
-    """Build a Karma-style material subnet.
+def _build_karma_material_builder_via_voptoolutils(wrapper, name):
+    if voptoolutils is None:
+        return None, None
 
-    Preferred path: a dedicated Karma Material Builder HDA if one is
-    registered. Fallback: a subnet configured like a Karma Material
-    Builder -- surface / displacement / properties output connectors,
-    kma_MaterialProperties node wired to `properties`, material flag set.
+    mask = getattr(voptoolutils, "KARMAMTLX_TAB_MASK", None)
+    if mask is None:
+        return None, None
 
-    Returns (karma_node, surface_out, disp_out, builder_type_used,
-             karma_props_was_added).
-    """
-    hda_type = _find_first_existing(KARMA_BUILDER_CANDIDATES)
-    if hda_type is not None:
+    if hasattr(voptoolutils, "_setupMtlXBuilderSubnet"):
+        params = _inspect_voptoolutils_signature() or []
+        subnet = wrapper.createNode("subnet", name)
+
+        candidate_values = {
+            "subnet_node":      subnet,
+            "destination_node": wrapper,
+            "name":             name,
+            "subnet_name":      name,
+            "ref_node_name":    "karmamaterial",
+            "mask":             mask,
+            "tab_mask":         mask,
+            "folder_label":     "Karma Material Builder",
+            "render_context":   "kma",
+            "node_graph":       "kma",
+            "node_graph_prefix": "kma",
+            "prefix":           "kma",
+        }
+        kwargs = {p: candidate_values[p] for p in params if p in candidate_values}
+
         try:
-            karma = parent.createNode(hda_type, name)
-            # Dedicated HDA: keep its pre-configured internals and just
-            # locate the outputs we need.
-            surf = _get_or_create_output(karma, "surface", "Surface")
-            disp = _get_or_create_output(karma, "displacement", "Displacement")
-            return karma, surf, disp, hda_type, False
+            voptoolutils._setupMtlXBuilderSubnet(**kwargs)
+            return subnet, "voptoolutils._setupMtlXBuilderSubnet(kwargs={})".format(
+                sorted(kwargs.keys()))
+        except Exception as err:
+            print("[WARN] _setupMtlXBuilderSubnet with kwargs failed: {}".format(err))
+
+        for args in (
+            (subnet, name, "karmamaterial", mask, "Karma Material Builder", "kma"),
+            (wrapper, subnet, name, "karmamaterial", mask, "Karma Material Builder", "kma"),
+            (subnet, name, mask, "Karma Material Builder", "kma"),
+        ):
+            try:
+                voptoolutils._setupMtlXBuilderSubnet(*args)
+                return subnet, "voptoolutils._setupMtlXBuilderSubnet(*args, n={})".format(
+                    len(args))
+            except Exception as err:
+                print("[WARN] _setupMtlXBuilderSubnet positional({}) failed: {}".format(
+                    len(args), err))
+
+        try:
+            subnet.destroy()
         except Exception:
-            # fall through to subnet path
             pass
 
-    # Subnet fallback: construct the Karma structure by hand
-    karma = parent.createNode("subnet", name)
-    for child in list(karma.children()):
+    if hasattr(voptoolutils, "createMaskedMtlXSubnet"):
+        kwargs_tab = {"destination_node": wrapper, "autoplace": False}
+        try:
+            result = voptoolutils.createMaskedMtlXSubnet(
+                kwargs_tab, "karmamaterial", mask,
+                "Karma Material Builder", "kma",
+            )
+            if result is not None:
+                try:
+                    result.setName(name, unique_name=True)
+                except Exception:
+                    pass
+                return result, "voptoolutils.createMaskedMtlXSubnet"
+        except Exception as err:
+            print("[WARN] createMaskedMtlXSubnet failed: {}".format(err))
+
+    return None, None
+
+
+def _build_karma_material_builder(wrapper, name, template):
+    if template is not None:
+        try:
+            return _build_karma_material_builder_from_template(wrapper, template, name)
+        except Exception as err:
+            print("[WARN] Template clone failed: {}".format(err))
+            traceback.print_exc()
+
+    vop_result, vop_method = _build_karma_material_builder_via_voptoolutils(
+        wrapper, name)
+    if vop_result is not None:
+        return vop_result, vop_method
+
+    print("[WARN] Falling back to bare subnet for '{}'".format(name))
+    subnet = wrapper.createNode("subnet", name)
+    for child in list(subnet.children()):
         try:
             child.destroy()
         except Exception:
             pass
+    return subnet, "bare_subnet"
 
-    _mark_as_material(karma)
 
-    surf = _create_output_connector(karma, "surface", "Surface")
-    disp = _create_output_connector(karma, "displacement", "Displacement")
+def _dump_suboutput(terminal, label=""):
+    if terminal is None or not DEBUG:
+        return
+    try:
+        print("  [suboutput dump {}]".format(label))
+        numparms = terminal.parm("numparms")
+        count = numparms.eval() if numparms is not None else 0
+        print("    numparms = {}".format(count))
+        for i in range(1, max(count + 1, 5)):
+            np = terminal.parm("parmname{}".format(i))
+            lp = terminal.parm("parmlabel{}".format(i))
+            tp = terminal.parm("parmtype{}".format(i))
+            if np is None and lp is None and tp is None:
+                try:
+                    inp = terminal.input(i - 1)
+                except Exception:
+                    inp = None
+                if inp is not None:
+                    print("    slot {} (idx {}): (no parms) <- {}".format(
+                        i, i - 1, inp.name()))
+                continue
+            name = np.eval() if np is not None else "?"
+            lbl = lp.eval() if lp is not None else "?"
+            tpv = tp.eval() if tp is not None else "?"
+            try:
+                input_node = terminal.input(i - 1)
+                src = input_node.name() if input_node else None
+            except Exception:
+                src = None
+            print("    slot {} (idx {}): name='{}' label='{}' type='{}'  <-  {}".format(
+                i, i - 1, name, lbl, tpv, src))
+    except Exception as err:
+        print("  [suboutput dump failed: {}]".format(err))
 
-    props_added = _add_karma_material_properties(karma)
 
-    return karma, surf, disp, "subnet+kma_props" if props_added else "subnet", props_added
+def _find_subnet_output_terminal(karma):
+    for child in karma.children():
+        if child.type().name() == "suboutput":
+            return child
+    for child in karma.children():
+        if child.type().name() == "collect":
+            return child
+    return None
+
+
+def _find_builder_internals(karma):
+    placeholder_surface = None
+    placeholder_disp = None
+    props_node = None
+
+    for child in karma.children():
+        tname = child.type().name().lower()
+        if tname == "mtlxstandard_surface" and placeholder_surface is None:
+            placeholder_surface = child
+        elif tname == "mtlxdisplacement" and placeholder_disp is None:
+            placeholder_disp = child
+        elif props_node is None and ("materialproperties" in tname
+                                     or "material_properties" in tname
+                                     or tname.startswith("kma_materialproperties")
+                                     or tname.endswith("materialproperties")):
+            props_node = child
+
+    terminal = _find_subnet_output_terminal(karma)
+
+    return {
+        "placeholder_surface": placeholder_surface,
+        "placeholder_disp":    placeholder_disp,
+        "props_node":          props_node,
+        "terminal":            terminal,
+    }
 
 
 def _build_wrapper(parent, anchor_node):
@@ -716,19 +808,202 @@ SPECIAL_CREATORS = {
 # Core conversion
 # ----------------------------------------------------------------------------
 
-def convert_material(arnold_builder, wrapper):
+def convert_material(arnold_builder, wrapper, template):
     report = MaterialReport(arnold_builder.name())
-    karma, surf_out, disp_out, builder_type, props_added = _build_karma_material_builder(
-        wrapper, arnold_builder.name()
-    )
-    report.builder_type_used = builder_type
-    report.karma_props_added = props_added
+
+    karma, method = _build_karma_material_builder(
+        wrapper, arnold_builder.name(), template)
+    report.builder_method = method
+
+    arnold_terminal = _find_output_terminal(arnold_builder)
+
+    internals = _find_builder_internals(karma)
+    terminal         = internals["terminal"]
+    placeholder_surf = internals["placeholder_surface"]
+    placeholder_disp = internals["placeholder_disp"]
+    props_node       = internals["props_node"]
+
+    _dump_suboutput(terminal, "right after clone")
+
+    # ========================================================================
+    # STEP A: FORCEFULLY RESET THE SUBOUTPUT
+    # Disconnect everything from the terminal and clear all existing parmnames.
+    # We're going to wire it fresh in a known order.
+    # ========================================================================
+    if terminal is not None:
+        # Disconnect everything
+        try:
+            num_inputs = len(terminal.inputs())
+            for i in range(num_inputs):
+                try:
+                    terminal.setInput(i, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Reset numparms to 0 so we can rebuild from scratch
+        try:
+            numparms = terminal.parm("numparms")
+            if numparms is not None:
+                numparms.set(0)
+        except Exception:
+            pass
+
+    _dump_suboutput(terminal, "after reset")
+
+    # ========================================================================
+    # STEP B: Ensure the three terminal nodes exist.
+    # If the placeholders are missing (odd template), create them.
+    # ========================================================================
+    if placeholder_surf is None:
+        try:
+            placeholder_surf = karma.createNode("mtlxstandard_surface", "mtlxstandard_surface")
+        except Exception as err:
+            print("[WARN] Could not create mtlxstandard_surface: {}".format(err))
+
+    if placeholder_disp is None:
+        try:
+            placeholder_disp = karma.createNode("mtlxdisplacement", "mtlxdisplacement")
+        except Exception as err:
+            print("[WARN] Could not create mtlxdisplacement: {}".format(err))
+
+    # props_node could legitimately be absent in some template variants;
+    # that's fine, we just skip wiring that slot.
+
+    # ========================================================================
+    # STEP C: Wire them in to the suboutput IN ORDER.
+    #   slot 0 (1st) = surface placeholder
+    #   slot 1 (2nd) = displacement placeholder
+    #   slot 2 (3rd) = properties node
+    #
+    # Then set numparms = 3 and populate each slot's parmname/label/type.
+    # ========================================================================
+
+    if terminal is not None:
+        # Wire surface FIRST
+        if placeholder_surf is not None:
+            try:
+                terminal.setInput(0, placeholder_surf, 0)
+            except Exception as err:
+                print("[WARN] wire surface to slot 0 failed: {}".format(err))
+
+        # Wire displacement SECOND
+        if placeholder_disp is not None:
+            try:
+                terminal.setInput(1, placeholder_disp, 0)
+            except Exception as err:
+                print("[WARN] wire displacement to slot 1 failed: {}".format(err))
+
+        # Wire properties THIRD
+        if props_node is not None:
+            try:
+                terminal.setInput(2, props_node, 0)
+                report.properties_connected = True
+            except Exception as err:
+                print("[WARN] wire properties to slot 2 failed: {}".format(err))
+
+        # Now set numparms and configure each slot's metadata.
+        slot_count = 3 if props_node is not None else 2
+        try:
+            numparms = terminal.parm("numparms")
+            if numparms is not None:
+                numparms.set(slot_count)
+        except Exception as err:
+            print("[WARN] could not set numparms={}: {}".format(slot_count, err))
+
+        # Slot 1 (surface)
+        try:
+            np = terminal.parm("parmname1")
+            lp = terminal.parm("parmlabel1")
+            tp = terminal.parm("parmtype1")
+            if np is not None: np.set("surface")
+            if lp is not None: lp.set("Surface")
+            if tp is not None:
+                try: tp.set("surface")
+                except Exception: pass
+        except Exception:
+            pass
+
+        # Slot 2 (displacement) -- renamed from default 'out1' to 'displacement'
+        try:
+            np = terminal.parm("parmname2")
+            lp = terminal.parm("parmlabel2")
+            tp = terminal.parm("parmtype2")
+            if np is not None: np.set("displacement")
+            if lp is not None: lp.set("Displacement")
+            if tp is not None:
+                try: tp.set("displacement")
+                except Exception: pass
+        except Exception:
+            pass
+
+        # Slot 3 (properties)
+        if props_node is not None:
+            try:
+                np = terminal.parm("parmname3")
+                lp = terminal.parm("parmlabel3")
+                tp = terminal.parm("parmtype3")
+                if np is not None: np.set("properties")
+                if lp is not None: lp.set("Properties")
+                if tp is not None:
+                    try: tp.set("struct")
+                    except Exception: pass
+            except Exception:
+                pass
+
+    _dump_suboutput(terminal, "after fresh wiring + rename")
+
+    # Record that displacement is pre-wired via placeholder.
+    # Pass 3 will set this to True specifically if Arnold has displacement.
+    # If Arnold doesn't, the placeholder stays and we'll mark it at the end.
+
+    # Known slot indices -- we've enforced them.
+    surf_idx  = 0
+    disp_idx  = 1
+    props_idx = 2 if props_node is not None else -1
+
+    term_parts = []
+    if terminal is not None:
+        try:
+            term_name = terminal.type().name()
+        except Exception:
+            term_name = "?"
+        try:
+            names = terminal.inputNames()
+        except Exception:
+            names = []
+        term_parts.append("terminal={}".format(term_name))
+        for classification, idx in (("surf", surf_idx),
+                                    ("disp", disp_idx),
+                                    ("props", props_idx)):
+            if 0 <= idx < len(names):
+                term_parts.append("{}[{}]={}".format(classification, idx, names[idx]))
+            else:
+                term_parts.append("{}=(none)".format(classification))
+    else:
+        term_parts.append("terminal=(not found)")
+    report.terminal_info = ", ".join(term_parts)
+
+    # ========================================================================
+    # STEP D: Destroy the surface placeholder. Pass 3 will wire the converted
+    # standard_surface into slot 0 in its place.
+    # ========================================================================
+    if placeholder_surf is not None:
+        try:
+            placeholder_surf.destroy()
+        except Exception:
+            pass
+
+    # The displacement node stays. If Arnold has displacement, Pass 1 will
+    # adopt it (reuse the same node, rename it).
+    displacement_node = placeholder_disp
 
     _copy_node_metadata(arnold_builder, karma)
 
     node_map = {}
 
-    # --- Pass 1: create MaterialX equivalents ---
+    # --- Pass 1: create MaterialX equivalents of Arnold nodes ---
     for a_node in arnold_builder.children():
         a_type = a_node.type().name()
 
@@ -752,15 +1027,24 @@ def convert_material(arnold_builder, wrapper):
                 if a_type.startswith("arnold"):
                     report.unmapped.append((a_node.name(), a_type))
                 continue
-            try:
-                new_node = karma.createNode(mtlx_type, a_node.name())
-                if via == "map":
-                    report.counts["nodes_via_map"] += 1
-                else:
-                    report.counts["nodes_via_guess"] += 1
-            except Exception as err:
-                report.create_failed.append((a_node.name(), a_type, str(err)))
-                continue
+
+            if a_type == "arnold::displacement" and displacement_node is not None:
+                new_node = displacement_node
+                try:
+                    new_node.setName(a_node.name(), unique_name=True)
+                except Exception:
+                    pass
+                report.counts["nodes_via_map"] += 1
+            else:
+                try:
+                    new_node = karma.createNode(mtlx_type, a_node.name())
+                    if via == "map":
+                        report.counts["nodes_via_map"] += 1
+                    else:
+                        report.counts["nodes_via_guess"] += 1
+                except Exception as err:
+                    report.create_failed.append((a_node.name(), a_type, str(err)))
+                    continue
 
         if new_node is None:
             continue
@@ -772,7 +1056,7 @@ def convert_material(arnold_builder, wrapper):
         if a_type not in SPECIAL_CREATORS:
             _copy_parms(a_node, new_node, report)
 
-    # --- Pass 2: rebuild connections ---
+    # --- Pass 2: rebuild shader graph connections ---
     for a_node, new_node in node_map.items():
         a_type = a_node.type().name()
         try:
@@ -816,25 +1100,33 @@ def convert_material(arnold_builder, wrapper):
                 report.counts["conns_wire_failed"] += 1
                 report.wire_issues.append((a_src.name(), a_node.name(), str(err)))
 
-    # --- Pass 3: output terminal ---
-    terminal = _find_output_terminal(arnold_builder)
-    if terminal is not None:
+    # --- Pass 3: wire converted surface/displacement into the terminal ---
+    if arnold_terminal is not None and terminal is not None:
         try:
-            term_conns = terminal.inputConnections()
+            term_conns = arnold_terminal.inputConnections()
         except Exception:
             term_conns = []
+        try:
+            arnold_input_names = arnold_terminal.inputNames()
+        except Exception:
+            arnold_input_names = []
+
+        if DEBUG:
+            print("  [pass 3] Arnold terminal has {} connections".format(len(term_conns)))
+
         for conn in term_conns:
             a_src = conn.inputNode()
             if a_src not in node_map:
                 continue
             try:
-                input_name = terminal.inputNames()[conn.inputIndex()].lower()
+                input_name = arnold_input_names[conn.inputIndex()]
             except Exception:
                 input_name = ""
-            is_disp = "disp" in input_name
-            target = disp_out if is_disp else surf_out
-            if target is None:
-                continue
+            classification = _classify_terminal_input(input_name)
+            is_disp = classification == "displacement"
+
+            idx = disp_idx if is_disp else surf_idx
+
             src_node = node_map[a_src]
             try:
                 out_count = len(src_node.outputNames())
@@ -844,24 +1136,35 @@ def convert_material(arnold_builder, wrapper):
             if out_idx >= out_count:
                 out_idx = 0
             try:
-                target.setInput(0, src_node, out_idx)
+                terminal.setInput(idx, src_node, out_idx)
                 if is_disp:
                     report.displacement_connected = True
                 else:
                     report.surface_connected = True
+                if DEBUG:
+                    print("    [pass 3] WIRED {} (arnold '{}') to terminal[{}]".format(
+                        src_node.name(), input_name, idx))
             except Exception as err:
                 report.wire_issues.append(
                     (a_src.name(),
-                     "OUTPUT({})".format("disp" if is_disp else "surf"),
+                     "OUTPUT({}) arnold_input={}".format(
+                        "disp" if is_disp else "surf", input_name),
                      str(err))
                 )
 
+    # If no Arnold displacement, the placeholder still sits in slot 1.
+    if not report.displacement_connected and displacement_node is not None \
+            and terminal is not None:
+        try:
+            if terminal.input(disp_idx) is displacement_node:
+                report.displacement_connected = True
+        except Exception:
+            pass
+
+    _dump_suboutput(terminal, "final")
+
     return karma, report
 
-
-# ----------------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------------
 
 def run():
     selected = hou.selectedNodes()
@@ -874,14 +1177,16 @@ def run():
         )
         return
 
-    hda_type = _find_first_existing(KARMA_BUILDER_CANDIDATES)
-    props_type = _find_first_existing(KARMA_PROPERTIES_CANDIDATES)
-
     print("")
     print("Starting Arnold -> MaterialX conversion ({} builder(s))".format(len(builders)))
     print("DEBUG={}  VERBOSE={}".format(DEBUG, VERBOSE))
-    print("Karma Material Builder HDA: {}".format(hda_type or "(not found, using subnet)"))
-    print("Karma Material Properties:  {}".format(props_type or "(not found)"))
+
+    template = _find_template_node(builders[0].parent())
+    if template is not None:
+        print("Using template Karma Material Builder: {}".format(template.path()))
+    else:
+        print("No template found. Using voptoolutils.")
+        _inspect_voptoolutils_signature()
 
     reports = []
     wrapper = None
@@ -890,7 +1195,7 @@ def run():
             wrapper = _build_wrapper(builders[0].parent(), builders[0])
             for builder in builders:
                 try:
-                    _, report = convert_material(builder, wrapper)
+                    _, report = convert_material(builder, wrapper, template)
                     reports.append(report)
                 except Exception as err:
                     crashed = MaterialReport(builder.name())
@@ -922,36 +1227,4 @@ def run():
 run()
 
 
-# FIVE -- what changed:
-#
-# - Each subnet is now constructed as a proper Karma Material Builder, not
-#   a VEX one. The difference is internal: a Karma Material Builder has
-#   a kma_MaterialProperties node wired into a `properties` output. The
-#   VEX Material Builder doesn't. Adding those makes the subnet behave
-#   as a Karma material rather than a VEX shader builder.
-#
-# - 'materialbuilder' removed from the HDA candidate list -- that's the
-#   VEX Material Builder operator type and was what you were warning me
-#   about. KARMA_BUILDER_CANDIDATES is now strictly Karma-specific names.
-#
-# - KARMA_PROPERTIES_CANDIDATES added. Script looks up the right type
-#   for kma_MaterialProperties on this build and creates one named
-#   "material_properties" if it exists. If it doesn't exist, the subnet
-#   is built without it (surface + displacement outputs only) and the
-#   report shows karma_props: False so you know.
-#
-# - Per-material report now includes a "Builder:" line showing both the
-#   builder type used ('kma_MaterialBuilder' / 'subnet+kma_props' /
-#   'subnet') and whether the Karma Material Properties node was added.
-#   Run header shows "Karma Material Builder HDA: ..." and "Karma
-#   Material Properties: ..." so you can confirm both lookups upfront.
-#
-# - Structure when subnet fallback is used:
-#     subnet (material flag set)
-#       surface_output       (subnetconnector)
-#       displacement_output  (subnetconnector)
-#       struct_output        (subnetconnector, name=properties)
-#       material_properties  (kma_MaterialProperties) -> struct_output
-#       ... all converted mtlx nodes ...
-#   Surface and displacement outputs wire from the converted shader and
-#   displacement nodes. Properties stays wired to kma_MaterialProperties.
+# FIVE
